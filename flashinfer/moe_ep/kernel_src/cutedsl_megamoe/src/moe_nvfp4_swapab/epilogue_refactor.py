@@ -18,6 +18,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int64, T
 from src.iket_compat import iket
+from src.phase_timing import PT, PT_NUM_SLOTS
+from src.ptx_helpers import read_clock64
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
 import cutlass.utils as utils
@@ -1044,6 +1046,7 @@ class SwapABSwigluFp4Epilogue:
         _fc1_eb, _fc2_eb = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(_fc1_eb)))
         self.fc2_epi_flag_batch = max(1, min(32, int(_fc2_eb)))
+        self.pt_cluster_shape_mn = cluster_shape_mn
         self.cluster_tile_intermediate_downproj = (
             self._EpilogueFc1IntermediateDownTileSize * cluster_shape_mn[0]
         )
@@ -1161,6 +1164,10 @@ class SwapABSwigluFp4Epilogue:
             ),
         )
 
+        pt_on = (
+            token_comm_args is not None
+            and getattr(token_comm_args, "phase_timing", None) is not None
+        )
         fc1_epi = SwapABFc1Epilogue(
             self,
             tidx,
@@ -1171,9 +1178,16 @@ class SwapABSwigluFp4Epilogue:
             fc1_output_sf,
             fc1_done_counter,
             optional_epi_args,
+            pt_enabled=pt_on,
         )
         fc2_epi = SwapABFc2Epilogue(
-            self, tidx, epi_smem_storage, fc2_output, token_comm_args, optional_epi_args
+            self,
+            tidx,
+            epi_smem_storage,
+            fc2_output,
+            token_comm_args,
+            optional_epi_args,
+            pt_enabled=pt_on,
         )
 
         acc_consumer_state = pipeline.make_pipeline_state(
@@ -1184,9 +1198,23 @@ class SwapABSwigluFp4Epilogue:
             num_threads=32 * self._EpilogueWarpCnt,
         )
         is_odd_turn = cutlass.Int32(1)
+        pt_loop_t0 = cutlass.Int64(0)
+        pt_consume = cutlass.Int64(0)
+        pt_fc1_wait = cutlass.Int64(0)
+        pt_fc1_call = cutlass.Int64(0)
+        pt_fc2_wait = cutlass.Int64(0)
+        pt_fc2_call = cutlass.Int64(0)
+        pt_drain = cutlass.Int64(0)
+        pt_flag = cutlass.Int64(0)
+        pt_t = cutlass.Int64(0)
+        if cutlass.const_expr(pt_on):
+            pt_loop_t0 = read_clock64()
+            pt_t = pt_loop_t0
         iket.range_push("epi_consume_work")
         work_tile_info = sched_consumer.consume_work()
         iket.range_pop()
+        if cutlass.const_expr(pt_on):
+            pt_consume += read_clock64() - pt_t
 
         flag_tracker = GpuReleaseFlagBatchTracker(
             flag_addr=Int64(0),
@@ -1201,24 +1229,32 @@ class SwapABSwigluFp4Epilogue:
             else:
                 tmem_stage_idx = acc_consumer_state.index
             tmem_acc_current = tmem_acc[None, None, tmem_stage_idx]
+            if cutlass.const_expr(pt_on):
+                pt_t = read_clock64()
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
                 # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
-                fc1_epi(
+                pt_w1 = fc1_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
                     is_odd_turn=is_odd_turn,
                 )
+                if cutlass.const_expr(pt_on):
+                    pt_fc1_call += read_clock64() - pt_t
+                    pt_fc1_wait += pt_w1
             else:
                 # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
-                fc2_epi(
+                pt_w2 = fc2_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
                     is_odd_turn=is_odd_turn,
                 )
+                if cutlass.const_expr(pt_on):
+                    pt_fc2_call += read_clock64() - pt_t
+                    pt_fc2_wait += pt_w2
             iket.range_pop()
 
             prev_work_tile_info = work_tile_info
@@ -1230,9 +1266,15 @@ class SwapABSwigluFp4Epilogue:
             if cutlass.const_expr(self.overlapping_accum):
                 is_odd_turn = cutlass.Int32(1) - is_odd_turn
 
+            if cutlass.const_expr(pt_on):
+                pt_t = read_clock64()
             iket.range_push("epi_consume_work")
             work_tile_info = sched_consumer.consume_work()
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_now = read_clock64()
+                pt_consume += pt_now - pt_t
+                pt_t = pt_now
 
             # Drain fc1 TMA stores and sf stores before publishing the fc1-done counter.
             iket.range_push("epi_drain_barrier")
@@ -1242,6 +1284,10 @@ class SwapABSwigluFp4Epilogue:
             # _fence_rel_gpu()
             wait_only_named_barrier.arrive_and_wait()
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_now = read_clock64()
+                pt_drain += pt_now - pt_t
+                pt_t = pt_now
 
             # Publish completion for the work tile snapshotted above.
             iket.range_push("epi_flag")
@@ -1254,8 +1300,34 @@ class SwapABSwigluFp4Epilogue:
                     prev_work_tile_info, work_tile_info, flag_tracker
                 )
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_flag += read_clock64() - pt_t
         # Tail flush
         flag_tracker.fire()
+        if cutlass.const_expr(pt_on):
+            pt_now = read_clock64()
+            bidx, bidy, bidz = cute.arch.block_idx()
+            pt_cta = (
+                cutlass.Int32(bidx)
+                + cutlass.Int32(self.pt_cluster_shape_mn[1]) * cutlass.Int32(bidy)
+                + cutlass.Int32(
+                    self.pt_cluster_shape_mn[1] * self.pt_cluster_shape_mn[0]
+                )
+                * cutlass.Int32(bidz)
+            )
+            if tidx == cutlass.Int32(0):
+                pt_base = pt_cta * cutlass.Int32(PT_NUM_SLOTS)
+                pt_buf = token_comm_args.phase_timing
+                pt_buf[pt_base + cutlass.Int32(PT["epi_consume_work"])] = pt_consume
+                pt_buf[pt_base + cutlass.Int32(PT["epi_fc1_wait"])] = pt_fc1_wait
+                pt_buf[pt_base + cutlass.Int32(PT["epi_fc1"])] = pt_fc1_call
+                pt_buf[pt_base + cutlass.Int32(PT["epi_fc2_wait"])] = pt_fc2_wait
+                pt_buf[pt_base + cutlass.Int32(PT["epi_fc2"])] = pt_fc2_call
+                pt_buf[pt_base + cutlass.Int32(PT["epi_drain_barrier"])] = pt_drain
+                pt_buf[pt_base + cutlass.Int32(PT["epi_flag"])] = pt_flag
+                pt_buf[pt_base + cutlass.Int32(PT["epi_loop_total"])] = (
+                    pt_now - pt_loop_t0
+                )
 
 
 class _ImmutableAfterInit:
@@ -1286,8 +1358,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: NvFp4OptinalEpiArgs,
+        pt_enabled: bool = False,
     ):
         self.base = base
+        self.pt_enabled = pt_enabled
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
@@ -1386,9 +1460,15 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             (self._EpilogueFc1IntermediateGateUpTileSize, self._EpilogueTokenTileSize),
         )[None, None, 0, None]
 
+        pt_wait = cutlass.Int64(0)
+        pt_t0 = cutlass.Int64(0)
+        if cutlass.const_expr(self.pt_enabled):
+            pt_t0 = read_clock64()
         iket.range_push("fc1_epi_wait")
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_pop()
+        if cutlass.const_expr(self.pt_enabled):
+            pt_wait = read_clock64() - pt_t0
         iket.range_push("fc1_epi")
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
@@ -1481,6 +1561,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         if cutlass.const_expr(not self.overlapping_accum):
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(acc_consumer_state)
+        return pt_wait
 
     @cute.jit
     def run_subtile(
@@ -1938,8 +2019,10 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
         token_comm_args: TokenCommArgs,
         optional_epi_args: NvFp4OptinalEpiArgs,
+        pt_enabled: bool = False,
     ):
         self.base = base
+        self.pt_enabled = pt_enabled
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
@@ -2092,12 +2175,18 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
         else:
             alpha_val = None
+        pt_wait = cutlass.Int64(0)
+        pt_t0 = cutlass.Int64(0)
         acc_ready = False
         if not work_tile_info.peek_ready:
             acc_ready = True
+            if cutlass.const_expr(self.pt_enabled):
+                pt_t0 = read_clock64()
             iket.range_push("fc2_epi_wait")
             acc_pipeline.consumer_wait(acc_consumer_state)
             iket.range_pop()
+            if cutlass.const_expr(self.pt_enabled):
+                pt_wait += read_clock64() - pt_t0
         fc2_output_router = self._make_output_router(work_tile_info)
         # (cta_tile_m, cta_tile_n) -> (epi_tile_m, epi_tile_n, iters)
         tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
@@ -2105,9 +2194,13 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             (self._EpilogueFc2HiddenTileSize, self._EpilogueTokenTileSize),
         )[None, None, 0, None]
 
+        if cutlass.const_expr(self.pt_enabled):
+            pt_t0 = read_clock64()
         iket.range_push("fc2_epi_wait")
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
         iket.range_pop()
+        if cutlass.const_expr(self.pt_enabled):
+            pt_wait += read_clock64() - pt_t0
         iket.range_push("fc2_epi")
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
@@ -2212,6 +2305,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         if cutlass.const_expr(not self.overlapping_accum):
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(acc_consumer_state)
+        return pt_wait
 
     @cute.jit
     def run_subtile(

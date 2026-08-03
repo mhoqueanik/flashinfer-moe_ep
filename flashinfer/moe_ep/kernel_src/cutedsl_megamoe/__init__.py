@@ -63,6 +63,7 @@ from .shim import (
     mxfp8_quantize_per_block_32,
     nvfp4_mega_launch_thunk,
     nvfp4_mega_moe,
+    phase_timing_layout,
     nvfp4_quantize_per_block_16,
     record_knobs,
     resolve_knobs,

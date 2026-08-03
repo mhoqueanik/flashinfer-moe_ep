@@ -38,6 +38,25 @@ from common.megamoe_constants import (
     SupportedMmaTileN,
 )
 from .moe_utils import spin_wait
+from src.phase_timing import PT, PT_NUM_SLOTS
+from src.ptx_helpers import read_clock64
+
+
+@cute.jit
+def _pt_store_slot(token_comm_args, cluster_shape_mn, slot_name, value):
+    """Store one Int64 cycle count into this CTA's phase-timing row (lane 0)."""
+    bidx, bidy, bidz = cute.arch.block_idx()
+    pt_cta = (
+        cutlass.Int32(bidx)
+        + cutlass.Int32(cluster_shape_mn[1]) * cutlass.Int32(bidy)
+        + cutlass.Int32(cluster_shape_mn[1] * cluster_shape_mn[0])
+        * cutlass.Int32(bidz)
+    )
+    if cute.arch.lane_idx() == cutlass.Int32(0):
+        token_comm_args.phase_timing[
+            pt_cta * cutlass.Int32(PT_NUM_SLOTS) + cutlass.Int32(PT[slot_name])
+        ] = value
+
 from . import dynamic_mainloop
 from src.token_comm import CombineFormat
 
@@ -1416,6 +1435,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             cta_rank_in_cluster
         )
         tidx, _, _ = cute.arch.thread_idx()
+        pt_on = token_comm_args is not None and (
+            getattr(token_comm_args, "phase_timing", None) is not None
+        )
+        pt_kernel_t0 = cutlass.Int64(0)
+        if cutlass.const_expr(pt_on):
+            pt_kernel_t0 = read_clock64()
 
         # SharedStorage.
         SchedCls = sched_params.get_scheduler_type()
@@ -1624,19 +1649,38 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     warp_idx=warp_idx,
                     sched_warp_id=self.sched_warp_id,
                 )
+            pt_sched_t0 = cutlass.Int64(0)
+            pt_publish = cutlass.Int64(0)
+            pt_t = cutlass.Int64(0)
+            if cutlass.const_expr(pt_on):
+                pt_sched_t0 = read_clock64()
             scheduler.gen_next_work()
             while scheduler.current_work.is_valid_tile:
                 ext.prefetch_for_expert(scheduler.current_work.expert_idx)
                 # producer_acquire backpressure: consumers not draining tiles.
+                if cutlass.const_expr(pt_on):
+                    pt_t = read_clock64()
                 iket.range_push("sched_publish")
                 scheduler.publish_work()
                 iket.range_pop()
+                if cutlass.const_expr(pt_on):
+                    pt_publish += read_clock64() - pt_t
                 scheduler.gen_next_work()
             # Sentinel publish (current_work is already invalid here).
             iket.range_push("sched_tail")
             scheduler.publish_work()
             scheduler.produce_tail()
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "sched_loop_total",
+                    read_clock64() - pt_sched_t0,
+                )
+                _pt_store_slot(
+                    token_comm_args, self.cluster_shape_mn, "sched_publish", pt_publish
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # TMA load warps (warps 5 / 6)
@@ -1667,9 +1711,17 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
             thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
 
+            pt_role_t0 = cutlass.Int64(0)
+            pt_idle = cutlass.Int64(0)
+            pt_t = cutlass.Int64(0)
+            if cutlass.const_expr(pt_on):
+                pt_role_t0 = read_clock64()
+                pt_t = pt_role_t0
             iket.range_push("tma_a_consume_work")
             work_tile_info = sched_consumer.consume_work()
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_idle += read_clock64() - pt_t
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -1828,11 +1880,28 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         )
 
                 iket.range_pop()
+                if cutlass.const_expr(pt_on):
+                    pt_t = read_clock64()
                 iket.range_push("tma_a_consume_work")
                 work_tile_info = sched_consumer.consume_work()
                 iket.range_pop()
+                if cutlass.const_expr(pt_on):
+                    pt_idle += read_clock64() - pt_t
 
             ab_producer.tail()
+            if cutlass.const_expr(pt_on):
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "tma_a_consume_work",
+                    pt_idle,
+                )
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "tma_a_loop_total",
+                    read_clock64() - pt_role_t0,
+                )
 
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
@@ -1880,9 +1949,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[0] - 1
             ) // self.cta_tile_shape_mnk[0]
 
+            pt_role_t0 = cutlass.Int64(0)
+            pt_idle = cutlass.Int64(0)
+            pt_fc1_spin = cutlass.Int64(0)
+            pt_fc2_spin = cutlass.Int64(0)
+            pt_t = cutlass.Int64(0)
+            if cutlass.const_expr(pt_on):
+                pt_role_t0 = read_clock64()
+                pt_t = pt_role_t0
             iket.range_push("tma_b_consume_work")
             work_tile_info = sched_consumer.consume_work()
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_idle += read_clock64() - pt_t
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -1898,10 +1977,14 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     # before issuing the TMA loads.  Base no-op: in the
                     # lean path the activation tensor is fully resident
                     # in GMEM by launch time, no per-tile wait required.
+                    if cutlass.const_expr(pt_on):
+                        pt_t = read_clock64()
                     self.token_comm_hook_fc1_tma_b_predispatch_spin(
                         token_comm_args,
                         work_tile_info,
                     )
+                    if cutlass.const_expr(pt_on):
+                        pt_fc1_spin += read_clock64() - pt_t
 
                     k_tile_cnt = k_tile_cnt_fc1
                     real_b, desc_ptr_b = ext.get_gmem_tensor(
@@ -2015,6 +2098,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     counter_ptr = fc1_done_counter.iterator + counter_slot
                     # If sched-warp peek saw saturation, the monotonic counter
                     # lets TMA-B skip its own spin.
+                    if cutlass.const_expr(pt_on):
+                        pt_t = read_clock64()
                     if not work_tile_info.peek_ready:
                         iket.range_push("tma_token_fc2_wait")
                         spin_wait(
@@ -2023,6 +2108,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             fail_sleep_cycles=500,
                         )
                         iket.range_pop()
+                    if cutlass.const_expr(pt_on):
+                        pt_fc2_spin += read_clock64() - pt_t
 
                     # fc1 workspace is fc2 GEMM-B/SFB for this token block.
                     k_tile_cnt = k_tile_cnt_fc2
@@ -2114,11 +2201,40 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             mcast_mask=sfb_full_mcast_mask,
                         )
                 iket.range_pop()
+                if cutlass.const_expr(pt_on):
+                    pt_t = read_clock64()
                 iket.range_push("tma_b_consume_work")
                 work_tile_info = sched_consumer.consume_work()
                 iket.range_pop()
+                if cutlass.const_expr(pt_on):
+                    pt_idle += read_clock64() - pt_t
 
             ab_producer.tail()
+            if cutlass.const_expr(pt_on):
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "tma_b_consume_work",
+                    pt_idle,
+                )
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "tma_b_fc1_wait",
+                    pt_fc1_spin,
+                )
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "tma_b_fc2_wait",
+                    pt_fc2_spin,
+                )
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "tma_b_loop_total",
+                    read_clock64() - pt_role_t0,
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # MMA warp (warp 4)
@@ -2180,9 +2296,20 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             # K-tile counts ``k_tile_cnt_fc1`` / ``k_tile_cnt_fc2`` come
             # from the enclosing scope (computed once before the TMA warps).
 
+            pt_role_t0 = cutlass.Int64(0)
+            pt_idle = cutlass.Int64(0)
+            pt_mma_fc1 = cutlass.Int64(0)
+            pt_mma_fc2 = cutlass.Int64(0)
+            pt_t = cutlass.Int64(0)
+            pt_tile_t0 = cutlass.Int64(0)
+            if cutlass.const_expr(pt_on):
+                pt_role_t0 = read_clock64()
+                pt_t = pt_role_t0
             iket.range_push("mma_consume_work")
             work_tile_info = sched_consumer.consume_work()
             iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_idle += read_clock64() - pt_t
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -2190,6 +2317,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 )
                 # Prebind k_tile_cnt due to DSL AST.
                 k_tile_cnt = cutlass.Int32(0)
+                if cutlass.const_expr(pt_on):
+                    pt_tile_t0 = read_clock64()
                 if is_phase_linear1:
                     k_tile_cnt = k_tile_cnt_fc1
                     iket.range_push("mma_fc1")
@@ -2303,11 +2432,39 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                 iket.range_pop()
 
+                if cutlass.const_expr(pt_on):
+                    pt_now = read_clock64()
+                    if is_phase_linear1:
+                        pt_mma_fc1 += pt_now - pt_tile_t0
+                    else:
+                        pt_mma_fc2 += pt_now - pt_tile_t0
+                    pt_t = pt_now
                 iket.range_push("mma_consume_work")
                 work_tile_info = sched_consumer.consume_work()
                 iket.range_pop()
+                if cutlass.const_expr(pt_on):
+                    pt_idle += read_clock64() - pt_t
 
             acc_pipeline.producer_tail(acc_producer_state)
+            if cutlass.const_expr(pt_on):
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "mma_consume_work",
+                    pt_idle,
+                )
+                _pt_store_slot(
+                    token_comm_args, self.cluster_shape_mn, "mma_fc1", pt_mma_fc1
+                )
+                _pt_store_slot(
+                    token_comm_args, self.cluster_shape_mn, "mma_fc2", pt_mma_fc2
+                )
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "mma_loop_total",
+                    read_clock64() - pt_role_t0,
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # Epilogue warps (warps 0-3)
@@ -2416,3 +2573,11 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             lane_idx=lane_idx,
             tidx=tidx,
         )
+        if cutlass.const_expr(pt_on):
+            if tidx == cutlass.Int32(0):
+                _pt_store_slot(
+                    token_comm_args,
+                    self.cluster_shape_mn,
+                    "kernel_total",
+                    read_clock64() - pt_kernel_t0,
+                )

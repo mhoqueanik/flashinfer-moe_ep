@@ -135,6 +135,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
             enable_iket=k.enable_iket,
+            enable_phase_timing=k.enable_phase_timing,
         )
 
     def validate_forward(

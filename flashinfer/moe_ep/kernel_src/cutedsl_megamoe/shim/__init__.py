@@ -97,6 +97,7 @@ from .nvfp4 import (
     make_dummy_epilogue_params,
     nvfp4_mega_launch_thunk,
     nvfp4_mega_moe,
+    phase_timing_layout,
 )
 from .mxfp8 import (
     MegaMoEMxfp8Config,

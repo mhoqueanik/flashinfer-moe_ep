@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from .iket_compat import iket as _iket
 
 from .grid_sync import software_grid_sync
+from .phase_timing import PT, PT_NUM_SLOTS
 from .ptx_helpers import (
     cp_reduce_async_bulk_add_noftz_bf16_s2g,
     fns_b32,
@@ -219,6 +220,7 @@ _MLIR_VALUE_FIELDS = (
     "grid_sync_counter",
     "local_zero_prefix",
     "shared_zero_prefix",
+    "phase_timing",
     "peer_rank_ptr_mapper",
     "local_rank",
 )
@@ -277,6 +279,7 @@ class TokenCommArgs:
         token_back_schedule_counter: cute.Pointer = None,
         combine_sf: cute.Tensor = None,
         fc2_output_sf: cute.Tensor = None,
+        phase_timing: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -302,6 +305,7 @@ class TokenCommArgs:
         self.grid_sync_counter = grid_sync_counter
         self.local_zero_prefix = local_zero_prefix
         self.shared_zero_prefix = shared_zero_prefix
+        self.phase_timing = phase_timing
         self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self.world_size = world_size
         self.local_rank = local_rank
@@ -542,10 +546,34 @@ class TokenInPullTokenBackPush:
         return token_comm_args.fc1_ready_counter.iterator
 
     @cute.jit
+    def _pt_store(self, token_comm_args, slot_name, value):
+        """Store one Int64 cycle count into this CTA's phase-timing row.
+
+        Trace-time no-op when ``phase_timing`` is absent.  Caller is
+        responsible for lane gating (call from one lane, or accept the
+        last-writer value -- all lanes of a warp see ~the same clock).
+        """
+        if cutlass.const_expr(token_comm_args.phase_timing is not None):
+            bidx, bidy, bidz = cute.arch.block_idx()
+            cta_linear_id = (
+                Int32(bidx)
+                + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+                + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
+                * Int32(bidz)
+            )
+            if cute.arch.lane_idx() == Int32(0):
+                token_comm_args.phase_timing[
+                    cta_linear_id * Int32(PT_NUM_SLOTS) + Int32(PT[slot_name])
+                ] = value
+
+    @cute.jit
     def sched_warp_pre_init_wait(self, token_comm_args):
         # The sched warp blocks here on the dispatch warps' count-exchange
         # barrier, so this range IS the cross-rank dispatch arrival latency
         # as seen by the compute side (dominant at low tokens/rank).
+        pt_t0 = Int64(0)
+        if cutlass.const_expr(token_comm_args.phase_timing is not None):
+            pt_t0 = read_clock64()
         _iket.range_push("Sched_PreInit_Wait")
         nb = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,
@@ -553,6 +581,10 @@ class TokenInPullTokenBackPush:
         )
         nb.arrive_and_wait()
         _iket.range_pop()
+        if cutlass.const_expr(token_comm_args.phase_timing is not None):
+            self._pt_store(
+                token_comm_args, "sched_pre_init_wait", read_clock64() - pt_t0
+            )
 
     @cute.jit
     def fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
@@ -1548,6 +1580,12 @@ class TokenInPullTokenBackPush:
         local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
 
         iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
+        pt_on = cutlass.const_expr(token_comm_args.phase_timing is not None)
+        pt_t0 = Int64(0)
+        pt_t1 = Int64(0)
+        if cutlass.const_expr(pt_on):
+            pt_t0 = read_clock64()
+            pt_t1 = pt_t0
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
@@ -1565,6 +1603,11 @@ class TokenInPullTokenBackPush:
             num_sms=token_comm_args.sm_count,
         )
 
+        if cutlass.const_expr(pt_on):
+            pt_t2 = read_clock64()
+            if local_warp_idx == Int32(0):
+                self._pt_store(token_comm_args, "dispatch_prep", pt_t2 - pt_t1)
+            pt_t1 = pt_t2
         if iket_active:
             _iket.range_pop()
             _iket.range_push("Dispatch_Barrier")
@@ -1590,6 +1633,11 @@ class TokenInPullTokenBackPush:
         )
         nb_dispatch_to_sched.arrive()
 
+        if cutlass.const_expr(pt_on):
+            pt_t2 = read_clock64()
+            if local_warp_idx == Int32(0):
+                self._pt_store(token_comm_args, "dispatch_barrier", pt_t2 - pt_t1)
+            pt_t1 = pt_t2
         if iket_active:
             _iket.range_pop()
             _iket.range_push("Dispatch_Pull")
@@ -1614,6 +1662,11 @@ class TokenInPullTokenBackPush:
             num_sms=token_comm_args.sm_count,
         )
 
+        if cutlass.const_expr(pt_on):
+            pt_t2 = read_clock64()
+            if local_warp_idx == Int32(0):
+                self._pt_store(token_comm_args, "dispatch_pull", pt_t2 - pt_t1)
+                self._pt_store(token_comm_args, "dispatch_total", pt_t2 - pt_t0)
         if iket_active:
             _iket.range_pop()
 
@@ -1771,6 +1824,10 @@ class TokenInPullTokenBackPush:
         # Thread 0's view of the all-warp rendezvous = time-to-quiesce of the
         # slowest warp; the sub-ranges below cover the NVLink drain/publish
         # barriers and counter resets that were previously invisible.
+        pt_on = cutlass.const_expr(token_comm_args.phase_timing is not None)
+        pt_t1 = Int64(0)
+        if cutlass.const_expr(pt_on):
+            pt_t1 = read_clock64()
         if tidx == Int32(0):
             _iket.range_push("Tail.Rendezvous")
         nb_kernel_tail = pipeline.NamedBarrier(
@@ -1780,6 +1837,10 @@ class TokenInPullTokenBackPush:
         nb_kernel_tail.arrive_and_wait()
         if tidx == Int32(0):
             _iket.range_pop()  # Tail.Rendezvous
+        if cutlass.const_expr(pt_on):
+            pt_t2 = read_clock64()
+            if tidx == Int32(0):
+                self._pt_store(token_comm_args, "tail_rendezvous", pt_t2 - pt_t1)
 
         # Only the dispatch warps run NVLink cleanup; standalone token-back
         # warps (>= token_back_warp_start) just join the rendezvous above.
@@ -1797,6 +1858,9 @@ class TokenInPullTokenBackPush:
             tail_iket_active = (cta_linear_id == Int32(0)) and (
                 local_warp_idx == Int32(0)
             )
+            pt_t1 = Int64(0)
+            if cutlass.const_expr(pt_on):
+                pt_t1 = read_clock64()
             if tail_iket_active:
                 _iket.range_push("Tail.NvlinkDrain")
             # Per-launch nvlink barrier count must be a multiple of 4 so the
@@ -1836,6 +1900,13 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            if cutlass.const_expr(pt_on):
+                pt_t2 = read_clock64()
+                if local_warp_idx == Int32(0):
+                    self._pt_store(
+                        token_comm_args, "tail_nvlink_drain", pt_t2 - pt_t1
+                    )
+                pt_t1 = pt_t2
             if tail_iket_active:
                 _iket.range_pop()  # Tail.NvlinkDrain
                 _iket.range_push("Tail.SharedReset")
@@ -1848,6 +1919,13 @@ class TokenInPullTokenBackPush:
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
             )
+            if cutlass.const_expr(pt_on):
+                pt_t2 = read_clock64()
+                if local_warp_idx == Int32(0):
+                    self._pt_store(
+                        token_comm_args, "tail_shared_reset", pt_t2 - pt_t1
+                    )
+                pt_t1 = pt_t2
             if tail_iket_active:
                 _iket.range_pop()  # Tail.SharedReset
                 _iket.range_push("Tail.NvlinkPublish")
@@ -1863,6 +1941,13 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            if cutlass.const_expr(pt_on):
+                pt_t2 = read_clock64()
+                if local_warp_idx == Int32(0):
+                    self._pt_store(
+                        token_comm_args, "tail_nvlink_publish", pt_t2 - pt_t1
+                    )
+                pt_t1 = pt_t2
             if tail_iket_active:
                 _iket.range_pop()  # Tail.NvlinkPublish
                 _iket.range_push("Tail.LocalReset")
@@ -1875,5 +1960,11 @@ class TokenInPullTokenBackPush:
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
             )
+            if cutlass.const_expr(pt_on):
+                pt_t2 = read_clock64()
+                if local_warp_idx == Int32(0):
+                    self._pt_store(
+                        token_comm_args, "tail_local_reset", pt_t2 - pt_t1
+                    )
             if tail_iket_active:
                 _iket.range_pop()  # Tail.LocalReset

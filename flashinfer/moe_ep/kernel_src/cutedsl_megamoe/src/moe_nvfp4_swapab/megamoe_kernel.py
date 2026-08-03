@@ -47,6 +47,7 @@ from cutlass.cutlass_dsl import Int64
 
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
 from .topk_reduce import TopkReduce
+from src.phase_timing import PT_MAX_CTAS, PT_NUM_SLOTS
 from src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
@@ -195,6 +196,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
+        enable_phase_timing: bool = False,
     ) -> None:
         # The combine wire format drives the fc2 epilogue encoder, token_comm
         # push, and the combine_quant/combine_sf workspace sizing. The dataflow
@@ -203,6 +205,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # quantized guard sits at the launch (see __call__), letting the workspace
         # anchor size + partition for quantized formats here.
         self.combine_format = combine_format
+        # clock64 phase-breakdown fallback (see src.phase_timing); compile-time
+        # flag -- default off keeps codegen identical to the uninstrumented
+        # kernel.  The workspace region exists either way (layout stability).
+        self.enable_phase_timing = enable_phase_timing
         if in_kernel_fc2_reduce and combine_format.is_quantized:
             raise ValueError(
                 f"in_kernel_fc2_reduce requires a non-quantized (bf16) combine "
@@ -693,6 +699,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 )
             )
 
+        # clock64 phase-timing rows (store-only; read back host-side).  Placed
+        # last so it perturbs no existing offset and stays out of the zero
+        # prefix (each launch overwrites its CTA's slots).
+        specs.append(
+            _RegionSpec(
+                "phase_timing",
+                cutlass.Int64,
+                (PT_MAX_CTAS * PT_NUM_SLOTS,),
+                16,
+            )
+        )
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -1402,6 +1419,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             (1,),
             16,
         )
+        if cutlass.const_expr(self.enable_phase_timing):
+            phase_timing = self._make_typed_view(
+                local_workspace,
+                self._local_offsets["phase_timing"],
+                cutlass.Int64,
+                (PT_MAX_CTAS * PT_NUM_SLOTS,),
+                (1,),
+                self._local_region_by_name["phase_timing"].align,
+            )
+        else:
+            phase_timing = None
         token_comm_args = ExtractedTokenCommArgs(
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
@@ -1427,6 +1455,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             grid_sync_counter=grid_sync_counter,
             local_zero_prefix=local_zero_prefix,
             shared_zero_prefix=shared_zero_prefix,
+            phase_timing=phase_timing,
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
             world_size=self.world_size,
             local_rank=peer_rank_ptr_mapper_host.rank_idx,

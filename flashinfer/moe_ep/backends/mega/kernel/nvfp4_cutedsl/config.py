@@ -50,3 +50,8 @@ class Nvfp4CutedslMegaMoeConfig:
     # lowering (needs a cutlass-dsl build that ships the iket dialect; on
     # wheels without it the markers no-op via the iket_compat shim).
     enable_iket: bool = False
+    # clock64 phase-breakdown fallback (kernel_src .../src/src/phase_timing.py):
+    # per-warp-role in-kernel cycle accounting readable via
+    # workspace._frontend.phase_timing_snapshot().  Timing-perturbing; off by
+    # default and never for perf-quotable runs.
+    enable_phase_timing: bool = False

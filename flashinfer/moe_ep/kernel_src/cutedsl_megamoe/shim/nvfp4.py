@@ -108,6 +108,9 @@ class MegaMoENvfp4Config:
     apply_topk_in_fc1: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    # clock64 phase-breakdown fallback (src.phase_timing): compile-time flag,
+    # off by default; latency of an instrumented run is NOT a perf number.
+    enable_phase_timing: bool = False
 
     def __post_init__(self) -> None:
         if self.world_size < 1:
@@ -442,6 +445,7 @@ class MegaMoENvfp4Frontend:
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
+            c.enable_phase_timing,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
@@ -503,6 +507,7 @@ class MegaMoENvfp4Frontend:
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
+            enable_phase_timing=c.enable_phase_timing,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -784,6 +789,25 @@ class MegaMoENvfp4Frontend:
         leading_dim = cutlass_torch.get_leading_dim(tensor)
         return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
+    def phase_timing_snapshot(self) -> "torch.Tensor":
+        """(PT_MAX_CTAS, PT_NUM_SLOTS) int64 cycle counts from the LAST launch.
+
+        Requires ``enable_phase_timing=True`` and at least one completed
+        ``run()``.  Rows past the launched CTA count are stale/zero.
+        """
+        from src.phase_timing import PT_MAX_CTAS, PT_NUM_SLOTS
+
+        if not self.config.enable_phase_timing:
+            raise ValueError("phase_timing_snapshot needs enable_phase_timing=True")
+        if self._mega is None:
+            raise ValueError("no compiled session; run() at least once first")
+        off = self._mega.kernel._local_offsets["phase_timing"]
+        n_bytes = PT_MAX_CTAS * PT_NUM_SLOTS * 8
+        flat = self._mega.local_workspace[off : off + n_bytes]
+        return (
+            flat.view(torch.int64).reshape(PT_MAX_CTAS, PT_NUM_SLOTS).clone().cpu()
+        )
+
     def _build_mega_runtime_kwargs(
         self,
         inputs: MegaMoENvfp4Inputs,
@@ -977,6 +1001,13 @@ class MegaMoESymmBuffer:
         return self.num_total_experts // self.world_size
 
 
+def phase_timing_layout():
+    """(slot-name -> index dict, num_slots, max_ctas, accum-slot name set)."""
+    from src.phase_timing import PT, PT_ACCUM_SLOTS, PT_MAX_CTAS, PT_NUM_SLOTS
+
+    return PT, PT_NUM_SLOTS, PT_MAX_CTAS, PT_ACCUM_SLOTS
+
+
 def get_symm_buffer_for_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -996,6 +1027,7 @@ def get_symm_buffer_for_mega_moe(
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     knobs: Optional[dict] = None,
     enable_iket: bool = False,
+    enable_phase_timing: bool = False,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1094,6 +1126,9 @@ def get_symm_buffer_for_mega_moe(
         # perf knobs, and passing it through ``knobs`` would flip resolution
         # to "explicit" and drop the heuristic/cached tile knobs.
         cfg = dataclasses.replace(cfg, enable_iket=True)
+    if enable_phase_timing:
+        # Same post-knob-resolution rationale as enable_iket.
+        cfg = dataclasses.replace(cfg, enable_phase_timing=True)
     if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
         # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
         # the combine accumulation order nondeterministic); cached/heuristic
