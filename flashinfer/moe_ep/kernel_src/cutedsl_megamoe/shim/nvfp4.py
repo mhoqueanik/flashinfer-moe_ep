@@ -995,6 +995,7 @@ def get_symm_buffer_for_mega_moe(
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     knobs: Optional[dict] = None,
+    enable_iket: bool = False,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1088,6 +1089,11 @@ def get_symm_buffer_for_mega_moe(
         ),
     )
     cfg = with_knobs(cfg, resolved_knobs)
+    if enable_iket:
+        # Applied after knob resolution on purpose: iket is orthogonal to the
+        # perf knobs, and passing it through ``knobs`` would flip resolution
+        # to "explicit" and drop the heuristic/cached tile knobs.
+        cfg = dataclasses.replace(cfg, enable_iket=True)
     if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
         # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
         # the combine accumulation order nondeterministic); cached/heuristic

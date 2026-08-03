@@ -811,6 +811,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     in_kernel_fc2_reduce: bool = False,
     token_back_by_dispatch: bool = False,
     knobs: Optional[dict] = None,
+    enable_iket: bool = False,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
 
@@ -868,6 +869,11 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             max_tokens=num_max_tokens,
         )
     cfg = with_knobs(cfg, knobs)
+    if enable_iket:
+        # Applied after knob resolution on purpose: iket is orthogonal to the
+        # perf knobs, and passing it through ``knobs`` would flip resolution
+        # to "explicit" and drop the heuristic/cached knobs.
+        cfg = dataclasses.replace(cfg, enable_iket=True)
     if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
         # Caller-owned correctness choice; see the NVFP4 factory. The MXFP8
         # kernel rejects ikr together with dispatch-warp token-back, so the

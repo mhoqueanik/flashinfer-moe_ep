@@ -134,6 +134,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            enable_iket=k.enable_iket,
         )
 
     def validate_forward(

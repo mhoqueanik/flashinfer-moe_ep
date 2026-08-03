@@ -46,3 +46,7 @@ class Nvfp4CutedslMegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+    # Compile with options="iket" so in-kernel event-tracing ranges survive
+    # lowering (needs a cutlass-dsl build that ships the iket dialect; on
+    # wheels without it the markers no-op via the iket_compat shim).
+    enable_iket: bool = False

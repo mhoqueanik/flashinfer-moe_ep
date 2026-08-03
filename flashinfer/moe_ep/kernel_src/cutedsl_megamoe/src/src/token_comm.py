@@ -543,11 +543,16 @@ class TokenInPullTokenBackPush:
 
     @cute.jit
     def sched_warp_pre_init_wait(self, token_comm_args):
+        # The sched warp blocks here on the dispatch warps' count-exchange
+        # barrier, so this range IS the cross-rank dispatch arrival latency
+        # as seen by the compute side (dominant at low tokens/rank).
+        _iket.range_push("Sched_PreInit_Wait")
         nb = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,
             num_threads=self.dispatch_to_sched_threads,
         )
         nb.arrive_and_wait()
+        _iket.range_pop()
 
     @cute.jit
     def fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
@@ -1763,11 +1768,18 @@ class TokenInPullTokenBackPush:
         lane_idx,
         tidx,
     ):
+        # Thread 0's view of the all-warp rendezvous = time-to-quiesce of the
+        # slowest warp; the sub-ranges below cover the NVLink drain/publish
+        # barriers and counter resets that were previously invisible.
+        if tidx == Int32(0):
+            _iket.range_push("Tail.Rendezvous")
         nb_kernel_tail = pipeline.NamedBarrier(
             barrier_id=self.kernel_tail_named_barrier_id,
             num_threads=self.kernel_tail_threads,
         )
         nb_kernel_tail.arrive_and_wait()
+        if tidx == Int32(0):
+            _iket.range_pop()  # Tail.Rendezvous
 
         # Only the dispatch warps run NVLink cleanup; standalone token-back
         # warps (>= token_back_warp_start) just join the rendezvous above.
@@ -1782,6 +1794,11 @@ class TokenInPullTokenBackPush:
                 * Int32(bidz)
             )
             local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            tail_iket_active = (cta_linear_id == Int32(0)) and (
+                local_warp_idx == Int32(0)
+            )
+            if tail_iket_active:
+                _iket.range_push("Tail.NvlinkDrain")
             # Per-launch nvlink barrier count must be a multiple of 4 so the
             # sense-reversing signal self-cancels back to its start state. The
             # launch already does 1 (dispatch_barrier) + 2 below (drain + publish,
@@ -1819,6 +1836,9 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            if tail_iket_active:
+                _iket.range_pop()  # Tail.NvlinkDrain
+                _iket.range_push("Tail.SharedReset")
             # Shared counters between the barriers: the slot=0 barrier below
             # publishes these zeros cross-rank for a back-to-back MegaMoE relaunch.
             self.tail_reset_counters(
@@ -1828,6 +1848,9 @@ class TokenInPullTokenBackPush:
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
             )
+            if tail_iket_active:
+                _iket.range_pop()  # Tail.SharedReset
+                _iket.range_push("Tail.NvlinkPublish")
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1840,6 +1863,9 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            if tail_iket_active:
+                _iket.range_pop()  # Tail.NvlinkPublish
+                _iket.range_push("Tail.LocalReset")
             # Local counters last: rank-local, and grid_sync/nvlink_barrier
             # counters above stay live until this final barrier completes.
             self.tail_reset_counters(
@@ -1849,3 +1875,5 @@ class TokenInPullTokenBackPush:
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
             )
+            if tail_iket_active:
+                _iket.range_pop()  # Tail.LocalReset

@@ -134,6 +134,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            enable_iket=k.enable_iket,
         )
 
     def validate_forward(

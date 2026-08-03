@@ -1587,7 +1587,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             )
 
         # Cluster wait before TMEM alloc.
+        iket.range_push("pipeline_init_wait")
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        iket.range_pop()
 
         mma_tiler_k = self.mma_tiler[2]
         # ``fc1_weight_gemm.shape[1]`` / ``fc2_weight_gemm.shape[1]``
@@ -1625,11 +1627,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             scheduler.gen_next_work()
             while scheduler.current_work.is_valid_tile:
                 ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                # producer_acquire backpressure: consumers not draining tiles.
+                iket.range_push("sched_publish")
                 scheduler.publish_work()
+                iket.range_pop()
                 scheduler.gen_next_work()
             # Sentinel publish (current_work is already invalid here).
+            iket.range_push("sched_tail")
             scheduler.publish_work()
             scheduler.produce_tail()
+            iket.range_pop()
 
         # ════════════════════════════════════════════════════════════════════
         # TMA load warps (warps 5 / 6)
@@ -1660,7 +1667,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
             thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
 
+            iket.range_push("tma_a_consume_work")
             work_tile_info = sched_consumer.consume_work()
+            iket.range_pop()
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -1819,7 +1828,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         )
 
                 iket.range_pop()
+                iket.range_push("tma_a_consume_work")
                 work_tile_info = sched_consumer.consume_work()
+                iket.range_pop()
 
             ab_producer.tail()
 
@@ -1869,7 +1880,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[0] - 1
             ) // self.cta_tile_shape_mnk[0]
 
+            iket.range_push("tma_b_consume_work")
             work_tile_info = sched_consumer.consume_work()
+            iket.range_pop()
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -2101,7 +2114,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             mcast_mask=sfb_full_mcast_mask,
                         )
                 iket.range_pop()
+                iket.range_push("tma_b_consume_work")
                 work_tile_info = sched_consumer.consume_work()
+                iket.range_pop()
 
             ab_producer.tail()
 
@@ -2165,7 +2180,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             # K-tile counts ``k_tile_cnt_fc1`` / ``k_tile_cnt_fc2`` come
             # from the enclosing scope (computed once before the TMA warps).
 
+            iket.range_push("mma_consume_work")
             work_tile_info = sched_consumer.consume_work()
+            iket.range_pop()
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = work_tile_info.phase == cutlass.Int32(
@@ -2286,7 +2303,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                 iket.range_pop()
 
+                iket.range_push("mma_consume_work")
                 work_tile_info = sched_consumer.consume_work()
+                iket.range_pop()
 
             acc_pipeline.producer_tail(acc_producer_state)
 

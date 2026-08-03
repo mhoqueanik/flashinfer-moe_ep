@@ -1184,7 +1184,9 @@ class SwapABSwigluFp4Epilogue:
             num_threads=32 * self._EpilogueWarpCnt,
         )
         is_odd_turn = cutlass.Int32(1)
+        iket.range_push("epi_consume_work")
         work_tile_info = sched_consumer.consume_work()
+        iket.range_pop()
 
         flag_tracker = GpuReleaseFlagBatchTracker(
             flag_addr=Int64(0),
@@ -1228,16 +1230,21 @@ class SwapABSwigluFp4Epilogue:
             if cutlass.const_expr(self.overlapping_accum):
                 is_odd_turn = cutlass.Int32(1) - is_odd_turn
 
+            iket.range_push("epi_consume_work")
             work_tile_info = sched_consumer.consume_work()
+            iket.range_pop()
 
             # Drain fc1 TMA stores and sf stores before publishing the fc1-done counter.
+            iket.range_push("epi_drain_barrier")
             if cur_was_linear1:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             # _fence_rel_gpu()
             wait_only_named_barrier.arrive_and_wait()
+            iket.range_pop()
 
             # Publish completion for the work tile snapshotted above.
+            iket.range_push("epi_flag")
             if cur_was_linear1:
                 flag_tracker = fc1_epi.signal_fc1_done(
                     prev_work_tile_info, work_tile_info, flag_tracker
@@ -1246,6 +1253,7 @@ class SwapABSwigluFp4Epilogue:
                 flag_tracker = fc2_epi.signal_fc2_done(
                     prev_work_tile_info, work_tile_info, flag_tracker
                 )
+            iket.range_pop()
         # Tail flush
         flag_tracker.fire()
 
@@ -1378,7 +1386,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             (self._EpilogueFc1IntermediateGateUpTileSize, self._EpilogueTokenTileSize),
         )[None, None, 0, None]
 
+        iket.range_push("fc1_epi_wait")
         acc_pipeline.consumer_wait(acc_consumer_state)
+        iket.range_pop()
         iket.range_push("fc1_epi")
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
@@ -2085,7 +2095,9 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         acc_ready = False
         if not work_tile_info.peek_ready:
             acc_ready = True
+            iket.range_push("fc2_epi_wait")
             acc_pipeline.consumer_wait(acc_consumer_state)
+            iket.range_pop()
         fc2_output_router = self._make_output_router(work_tile_info)
         # (cta_tile_m, cta_tile_n) -> (epi_tile_m, epi_tile_n, iters)
         tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
@@ -2093,7 +2105,9 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             (self._EpilogueFc2HiddenTileSize, self._EpilogueTokenTileSize),
         )[None, None, 0, None]
 
+        iket.range_push("fc2_epi_wait")
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
+        iket.range_pop()
         iket.range_push("fc2_epi")
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
@@ -2236,12 +2250,16 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             casted=casted,
             tmem_subtile_view=tmem_subtile_tensor,
         )
+        # In the default epi_warps token-back mode this store IS the
+        # cross-rank combine (peer STG through the router's dst_ptrs).
+        iket.range_push("fc2_store_combine")
         process_pipeline.store_function(
             epi=self,
             subtile=pre_store,
             subtile_idx=subtile_idx,
             fc2_output_router=fc2_output_router,
         )
+        iket.range_pop()
 
 
 @dataclasses.dataclass(frozen=True)
