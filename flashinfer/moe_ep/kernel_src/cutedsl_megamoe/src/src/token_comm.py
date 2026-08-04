@@ -1673,6 +1673,9 @@ class TokenInPullTokenBackPush:
         if cutlass.const_expr(
             self.enable_token_back and not self.token_back_standalone
         ):
+            pt_tb_t0 = Int64(0)
+            if cutlass.const_expr(pt_on):
+                pt_tb_t0 = read_clock64()
             if iket_active:
                 _iket.range_push("Token_Back_By_Push")
 
@@ -1699,6 +1702,12 @@ class TokenInPullTokenBackPush:
 
             if iket_active:
                 _iket.range_pop()
+            if cutlass.const_expr(pt_on):
+                pt_tb_t1 = read_clock64()
+                if local_warp_idx == Int32(0):
+                    self._pt_store(
+                        token_comm_args, "token_back_push", pt_tb_t1 - pt_tb_t0
+                    )
 
     @cute.jit
     def token_back_warp_body(
@@ -1747,6 +1756,9 @@ class TokenInPullTokenBackPush:
         cute.arch.sync_warp()
 
         iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
+        pt_tb_t0 = Int64(0)
+        if cutlass.const_expr(token_comm_args.phase_timing is not None):
+            pt_tb_t0 = read_clock64()
         if iket_active:
             _iket.range_push("Token_Back_By_Push_Standalone")
 
@@ -1773,6 +1785,12 @@ class TokenInPullTokenBackPush:
 
         if iket_active:
             _iket.range_pop()
+        if cutlass.const_expr(token_comm_args.phase_timing is not None):
+            pt_tb_t1 = read_clock64()
+            if local_warp_idx == Int32(0):
+                self._pt_store(
+                    token_comm_args, "token_back_push", pt_tb_t1 - pt_tb_t0
+                )
 
     @cute.jit
     def tail_reset_counters(

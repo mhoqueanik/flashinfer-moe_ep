@@ -62,9 +62,14 @@ PT = {
     "tail_local_reset": 29,
     # whole kernel (thread 0)
     "kernel_total": 30,
+    # token-back push when NOT in epi_warps mode (standalone_warps:
+    # w12-15; reuse_dispatch_warps: dispatch warps after the pull) --
+    # the combine cost that leaves epi_fc2 under those modes.
+    "token_back_push": 31,
 }
 
 PT_ACCUM_SLOTS = {
+    "token_back_push",
     "sched_publish",
     "tma_a_consume_work",
     "tma_b_consume_work",
